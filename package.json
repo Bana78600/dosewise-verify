@@ -1,0 +1,13 @@
+{
+  "name": "dosewise-verification-server",
+  "version": "1.0.0",
+  "private": true,
+  "description": "PMDC licence verification + Firebase approval for DoseWise",
+  "main": "index.js",
+  "engines": { "node": ">=20" },
+  "scripts": { "start": "node index.js" },
+  "dependencies": {
+    "express": "^4.21.2",
+    "firebase-admin": "^13.0.2"
+  }
+}
