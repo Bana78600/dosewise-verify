@@ -230,6 +230,9 @@ app.post('/discussion', async (req, res) => {
         uid,
         categories: verdict.categories,
         stage: verdict.stage,
+        // Links the rejection to its agent session trace in the Console, so a
+        // disputed decision can actually be looked at.
+        sessionId: verdict.sessionId ?? null,
         at: admin.firestore.FieldValue.serverTimestamp(),
       });
       return res.json({ ok: false, reason: verdict.reason });
@@ -254,6 +257,9 @@ app.post('/discussion', async (req, res) => {
     // abuse can still be traced without exposing who wrote what.
     await db.collection('discussionAuthors').doc(ref.id).set({
       uid,
+      // Kept here rather than on the public message so the approval trace is
+      // auditable without being visible to other members.
+      moderationSessionId: verdict.sessionId ?? null,
       at: admin.firestore.FieldValue.serverTimestamp(),
     });
 
