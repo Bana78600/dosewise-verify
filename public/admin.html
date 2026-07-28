@@ -1,0 +1,322 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<title>DoseWise Admin</title>
+<style>
+  :root{
+    --bg:#0b1220; --surface:#141d31; --surface2:#1c2740; --border:#2a3550;
+    --primary:#14b8a6; --text:#eaf0fb; --muted:#9fb0cc; --faint:#6b7a99;
+    --danger:#ef4444; --dangerbg:#3a1620; --warn:#f59e0b; --ok:#22c55e;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--text);
+    font:14px/1.5 system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
+  a{color:var(--primary)}
+  .wrap{max-width:1100px;margin:0 auto;padding:24px}
+  h1{font-size:20px;margin:0;font-weight:900;letter-spacing:-.3px}
+  h2{font-size:14px;margin:0 0 12px;color:var(--muted);text-transform:uppercase;letter-spacing:1px}
+  .top{display:flex;align-items:center;gap:12px;padding:16px 24px;
+    border-bottom:1px solid var(--border);background:var(--surface)}
+  .top .who{margin-left:auto;color:var(--faint);font-size:12px}
+  button{font:inherit;cursor:pointer;border-radius:8px;border:1px solid var(--border);
+    background:var(--surface2);color:var(--text);padding:8px 14px;font-weight:700}
+  button:hover{border-color:var(--primary)}
+  button.primary{background:var(--primary);color:#04201c;border-color:var(--primary)}
+  button.danger{background:var(--dangerbg);border-color:var(--danger);color:#ffd9d9}
+  button:disabled{opacity:.45;cursor:default}
+  button.sm{padding:5px 10px;font-size:12px;font-weight:600}
+  input{font:inherit;background:var(--bg);color:var(--text);border:1px solid var(--border);
+    border-radius:8px;padding:10px 12px;width:100%}
+  .tabs{display:flex;gap:8px;flex-wrap:wrap;margin:20px 0}
+  .tabs button.on{border-color:var(--primary);background:#0f2f2b;color:var(--primary)}
+  .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:12px;margin-bottom:20px}
+  .card{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:14px}
+  .card .n{font-size:24px;font-weight:900}
+  .card .l{color:var(--faint);font-size:11px;text-transform:uppercase;letter-spacing:1px}
+  table{width:100%;border-collapse:collapse;font-size:13px}
+  th{text-align:left;color:var(--faint);font-size:11px;text-transform:uppercase;
+    letter-spacing:1px;padding:8px;border-bottom:1px solid var(--border)}
+  td{padding:10px 8px;border-bottom:1px solid var(--border);vertical-align:top}
+  tr:hover td{background:#111a2c}
+  .pill{display:inline-block;padding:2px 8px;border-radius:99px;font-size:11px;font-weight:700}
+  .ok{background:#0d3b2a;color:#7ee2b8}
+  .no{background:var(--dangerbg);color:#ffb4b4}
+  .tag{background:var(--surface2);color:var(--muted)}
+  .muted{color:var(--faint)}
+  .post{white-space:pre-wrap;max-width:520px}
+  .login{max-width:360px;margin:12vh auto;background:var(--surface);
+    border:1px solid var(--border);border-radius:16px;padding:28px}
+  .login h1{text-align:center;margin-bottom:4px}
+  .login p{text-align:center;color:var(--faint);font-size:12px;margin:0 0 20px}
+  .field{margin-bottom:12px}
+  .err{background:var(--dangerbg);border:1px solid var(--danger);color:#ffd9d9;
+    border-radius:8px;padding:10px;font-size:13px;margin-bottom:12px}
+  .note{background:var(--surface2);border:1px solid var(--border);border-radius:8px;
+    padding:10px 12px;color:var(--muted);font-size:12px;margin-bottom:16px}
+  .empty{color:var(--faint);padding:28px;text-align:center}
+  @media(max-width:640px){ .post{max-width:none} td,th{padding:8px 4px} }
+</style>
+</head>
+<body>
+
+<div id="login" class="login">
+  <h1>DoseWise Admin</h1>
+  <p>Administrators only</p>
+  <div id="loginErr" class="err" style="display:none"></div>
+  <div class="field"><input id="email" type="email" placeholder="Email" autocomplete="username"></div>
+  <div class="field"><input id="password" type="password" placeholder="Password" autocomplete="current-password"></div>
+  <button id="signin" class="primary" style="width:100%">Sign in</button>
+</div>
+
+<div id="app" style="display:none">
+  <div class="top">
+    <h1>DoseWise Admin</h1>
+    <span class="who" id="who"></span>
+    <button class="sm" id="signout">Sign out</button>
+  </div>
+  <div class="wrap">
+    <div class="cards" id="cards"></div>
+    <div class="tabs" id="tabs"></div>
+    <div id="view"></div>
+  </div>
+</div>
+
+<script>
+// The web API key is a public client identifier, not a secret — the same value
+// already ships inside the Android app. What protects this panel is the admin
+// custom claim, which the server verifies on every request.
+const API_KEY = "__WEB_API_KEY__";
+const $ = (id) => document.getElementById(id);
+
+// sessionStorage, not localStorage: the session dies with the tab.
+let auth = JSON.parse(sessionStorage.getItem("dw_admin") || "null");
+
+function esc(s){ return String(s ?? "").replace(/[&<>"']/g, c => (
+  {"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c])); }
+function when(iso){ return iso ? new Date(iso).toLocaleString() : "—"; }
+
+async function signIn(email, password){
+  const r = await fetch(
+    `https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key=${API_KEY}`,
+    { method:"POST", headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({ email, password, returnSecureToken:true }) });
+  const j = await r.json();
+  if(!j.idToken) throw new Error(
+    j.error?.message === "INVALID_LOGIN_CREDENTIALS" ? "Incorrect email or password."
+    : j.error?.message === "TOO_MANY_ATTEMPTS_TRY_LATER" ? "Too many attempts. Try again later."
+    : "Sign-in failed.");
+  return { idToken:j.idToken, refreshToken:j.refreshToken, email:j.email, at:Date.now() };
+}
+
+async function refresh(){
+  if(!auth?.refreshToken) throw new Error("no session");
+  const r = await fetch(`https://securetoken.googleapis.com/v1/token?key=${API_KEY}`,
+    { method:"POST", headers:{"Content-Type":"application/x-www-form-urlencoded"},
+      body:`grant_type=refresh_token&refresh_token=${encodeURIComponent(auth.refreshToken)}` });
+  const j = await r.json();
+  if(!j.id_token) throw new Error("session expired");
+  auth = { ...auth, idToken:j.id_token, refreshToken:j.refresh_token, at:Date.now() };
+  sessionStorage.setItem("dw_admin", JSON.stringify(auth));
+}
+
+async function api(path, opts = {}){
+  // ID tokens last an hour; refresh a little early rather than letting a click fail.
+  if(auth && Date.now() - auth.at > 50*60*1000) await refresh().catch(()=>{});
+  const r = await fetch("/admin/api" + path, {
+    ...opts,
+    headers: { ...(opts.headers||{}), "Content-Type":"application/json",
+               Authorization: "Bearer " + auth.idToken },
+  });
+  if(r.status === 401){ await refresh(); return api(path, opts); }
+  const j = await r.json();
+  if(r.status === 403) throw new Error(j.reason || "Not an administrator.");
+  return j;
+}
+
+$("signin").onclick = async () => {
+  const btn = $("signin"); btn.disabled = true; $("loginErr").style.display = "none";
+  try{
+    auth = await signIn($("email").value.trim(), $("password").value);
+    sessionStorage.setItem("dw_admin", JSON.stringify(auth));
+    await start();
+  }catch(e){
+    $("loginErr").textContent = e.message; $("loginErr").style.display = "block";
+  }finally{ btn.disabled = false; }
+};
+$("password").addEventListener("keydown", e => { if(e.key === "Enter") $("signin").click(); });
+$("signout").onclick = () => { sessionStorage.removeItem("dw_admin"); location.reload(); };
+
+const TABS = [
+  ["accounts","Accounts"], ["board","Board"], ["reported","Reported"],
+  ["licences","Licences"], ["modlog","Filter log"], ["adminlog","Admin log"],
+];
+let tab = "accounts";
+
+async function start(){
+  try{
+    const o = await api("/overview");
+    if(o.ok === false) throw new Error(o.reason);
+    $("login").style.display = "none";
+    $("app").style.display = "block";
+    $("who").textContent = auth.email;
+    $("cards").innerHTML = [
+      ["Accounts", o.users], ["Approved", o.approved], ["Pending", o.pending],
+      ["Posts", o.posts], ["Reported", o.hidden], ["Licences", o.licences],
+    ].map(([l,n]) => `<div class="card"><div class="n">${n}</div><div class="l">${esc(l)}</div></div>`).join("");
+    $("tabs").innerHTML = TABS.map(([k,l]) =>
+      `<button data-tab="${k}" class="${k===tab?"on":""}">${esc(l)}</button>`).join("");
+    $("tabs").querySelectorAll("button").forEach(b =>
+      b.onclick = () => { tab = b.dataset.tab; start(); });
+    await render();
+  }catch(e){
+    sessionStorage.removeItem("dw_admin"); auth = null;
+    $("login").style.display = "block"; $("app").style.display = "none";
+    $("loginErr").textContent = e.message; $("loginErr").style.display = "block";
+  }
+}
+
+async function act(fn){ try{ await fn(); await start(); }catch(e){ alert(e.message); } }
+
+async function render(){
+  const v = $("view");
+  v.innerHTML = '<div class="empty">Loading…</div>';
+
+  if(tab === "accounts"){
+    const q = "";
+    const d = await api("/users?q=" + encodeURIComponent(q));
+    v.innerHTML = `
+      <h2>Accounts</h2>
+      <div class="field"><input id="q" placeholder="Search name, email or PMDC number"></div>
+      <table><thead><tr><th>Clinician</th><th>PMDC</th><th>Status</th><th></th></tr></thead>
+      <tbody>${d.rows.map(r => `
+        <tr>
+          <td><b>${esc(r.fullName || "—")}</b>${r.isAdmin ? ' <span class="pill tag">admin</span>' : ""}
+              <div class="muted">${esc(r.email || "")}</div>
+              <div class="muted">joined ${when(r.createdAt)}</div></td>
+          <td>${esc(r.licenseNumber || "—")}
+              <div class="muted">${esc(r.pmdcStatus || "")} ${esc(r.pmdcValidUpto || "")}</div></td>
+          <td><span class="pill ${r.approved ? "ok":"no"}">${r.approved ? "approved":"no access"}</span>
+              <div class="muted">${esc(r.lastVerification || "")}</div></td>
+          <td><button class="sm ${r.approved ? "danger":"primary"}"
+                data-uid="${r.uid}" data-to="${r.approved ? "0":"1"}"
+              >${r.approved ? "Revoke":"Approve"}</button></td>
+        </tr>`).join("")}</tbody></table>
+      ${d.rows.length ? "" : '<div class="empty">No accounts match.</div>'}`;
+    $("q").oninput = debounce(async (e) => {
+      const rows = (await api("/users?q=" + encodeURIComponent(e.target.value))).rows;
+      const body = v.querySelector("tbody");
+      body.innerHTML = rows.map(r => `
+        <tr><td><b>${esc(r.fullName || "—")}</b><div class="muted">${esc(r.email||"")}</div></td>
+        <td>${esc(r.licenseNumber||"—")}</td>
+        <td><span class="pill ${r.approved?"ok":"no"}">${r.approved?"approved":"no access"}</span></td>
+        <td><button class="sm ${r.approved?"danger":"primary"}" data-uid="${r.uid}"
+            data-to="${r.approved?"0":"1"}">${r.approved?"Revoke":"Approve"}</button></td></tr>`).join("");
+      wireUsers();
+    }, 250);
+    wireUsers();
+    function wireUsers(){
+      v.querySelectorAll("button[data-uid]").forEach(b => b.onclick = () => act(async () => {
+        const on = b.dataset.to === "1";
+        if(!on && !confirm("Remove this clinician's access to DoseWise?")) return;
+        const r = await api(`/users/${b.dataset.uid}/approved`,
+          { method:"POST", body: JSON.stringify({ approved:on }) });
+        if(r.ok === false) throw new Error(r.reason);
+      }));
+    }
+  }
+
+  if(tab === "board"){
+    const d = await api("/posts");
+    v.innerHTML = `<h2>Board — ${d.rows.length} most recent</h2>
+      <div class="note">Authors of anonymous posts are not shown here. They appear under
+      Reported only, where acting on abuse requires knowing the account.</div>
+      <table><thead><tr><th>Post</th><th>By</th><th>Helpful</th><th></th></tr></thead>
+      <tbody>${d.rows.map(r => `
+        <tr><td class="post">${esc(r.text)}<div class="muted">${when(r.createdAt)}</div></td>
+        <td>${esc(r.displayName)}${r.anonymous ? ' <span class="pill tag">anon</span>' : ""}</td>
+        <td>${r.score || 0}</td>
+        <td><button class="sm danger" data-del="${r.id}">Remove</button></td></tr>`).join("")}
+      </tbody></table>${d.rows.length ? "" : '<div class="empty">No posts yet.</div>'}`;
+    v.querySelectorAll("button[data-del]").forEach(b => b.onclick = () => act(async () => {
+      if(!confirm("Remove this post from the board? It is kept under Reported.")) return;
+      await api(`/posts/${b.dataset.del}`, { method:"DELETE" });
+    }));
+  }
+
+  if(tab === "reported"){
+    const d = await api("/hidden");
+    v.innerHTML = `<h2>Reported &amp; removed</h2>
+      <div class="note">These posts were pulled by member reports or removed by an
+      administrator. The author is shown so abuse can be acted on, including for
+      posts made anonymously.</div>
+      <table><thead><tr><th>Post</th><th>Author</th><th>Why</th><th></th></tr></thead>
+      <tbody>${d.rows.map(r => `
+        <tr><td class="post">${esc(r.text)}<div class="muted">${when(r.hiddenAt)}</div></td>
+        <td>${esc(r.authorEmail || r.authorUid || "unknown")}
+            ${r.anonymous ? ' <span class="pill tag">posted anon</span>' : ""}</td>
+        <td>${r.hiddenBy === "admin" ? "removed by admin"
+             : `${r.reportCount} report${r.reportCount === 1 ? "" : "s"}`}</td>
+        <td><button class="sm" data-restore="${r.id}">Restore</button>
+            <button class="sm danger" data-purge="${r.id}">Delete</button></td></tr>`).join("")}
+      </tbody></table>${d.rows.length ? "" : '<div class="empty">Nothing reported.</div>'}`;
+    v.querySelectorAll("button[data-restore]").forEach(b => b.onclick = () => act(async () => {
+      await api(`/hidden/${b.dataset.restore}/restore`, { method:"POST" });
+    }));
+    v.querySelectorAll("button[data-purge]").forEach(b => b.onclick = () => act(async () => {
+      if(!confirm("Delete permanently? This cannot be undone.")) return;
+      await api(`/hidden/${b.dataset.purge}`, { method:"DELETE" });
+    }));
+  }
+
+  if(tab === "licences"){
+    const d = await api("/licences");
+    v.innerHTML = `<h2>PMDC licence claims</h2>
+      <div class="note">One registration number belongs to one account. Release a claim
+      only when a clinician has genuinely lost access to their email — it lets that
+      number register again.</div>
+      <table><thead><tr><th>Registration</th><th>Held by</th><th>Since</th><th></th></tr></thead>
+      <tbody>${d.rows.map(r => `
+        <tr><td><b>${esc(r.registrationNo)}</b></td>
+        <td>${esc(r.email || r.uid || "—")}</td>
+        <td>${when(r.claimedAt)}${r.backfilled ? ' <span class="pill tag">backfilled</span>' : ""}</td>
+        <td><button class="sm danger" data-rel="${encodeURIComponent(r.key)}">Release</button></td></tr>`).join("")}
+      </tbody></table>${d.rows.length ? "" : '<div class="empty">No licences claimed yet.</div>'}`;
+    v.querySelectorAll("button[data-rel]").forEach(b => b.onclick = () => act(async () => {
+      if(!confirm("Release this registration number so it can be used by a new account?")) return;
+      await api(`/licences/${b.dataset.rel}`, { method:"DELETE" });
+    }));
+  }
+
+  if(tab === "modlog"){
+    const d = await api("/moderation-log");
+    v.innerHTML = `<h2>Blocked posts</h2>
+      <div class="note">Posts the filter refused. The text is deliberately not stored.</div>
+      <table><thead><tr><th>When</th><th>Clinician</th><th>Reason</th></tr></thead>
+      <tbody>${d.rows.map(r => `
+        <tr><td>${when(r.at)}</td><td>${esc(r.email || "—")}</td>
+        <td>${(r.categories||[]).map(c => `<span class="pill tag">${esc(c)}</span>`).join(" ")}
+            <span class="muted">${esc(r.stage)}</span></td></tr>`).join("")}
+      </tbody></table>${d.rows.length ? "" : '<div class="empty">Nothing blocked yet.</div>'}`;
+  }
+
+  if(tab === "adminlog"){
+    const d = await api("/admin-log");
+    v.innerHTML = `<h2>Administrator actions</h2>
+      <table><thead><tr><th>When</th><th>Who</th><th>Action</th><th>Target</th></tr></thead>
+      <tbody>${d.rows.map(r => `
+        <tr><td>${when(r.at)}</td><td>${esc(r.byEmail)}</td>
+        <td><span class="pill tag">${esc(r.action)}</span></td>
+        <td class="muted">${esc(r.detail)}</td></tr>`).join("")}
+      </tbody></table>${d.rows.length ? "" : '<div class="empty">No actions yet.</div>'}`;
+  }
+}
+
+function debounce(fn, ms){ let t; return (...a) => { clearTimeout(t); t = setTimeout(() => fn(...a), ms); }; }
+
+if(auth) start();
+</script>
+</body>
+</html>

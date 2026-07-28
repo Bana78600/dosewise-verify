@@ -12,6 +12,8 @@
  *   ALLOWED_ORIGIN            – optional CORS origin (default "*")
  */
 
+const fs = require('fs');
+const path = require('path');
 const express = require('express');
 const admin = require('firebase-admin');
 const { verifyLicence, norm } = require('./pmdc');
@@ -36,6 +38,24 @@ app.use((req, res, next) => {
 });
 
 app.get('/health', (_req, res) => res.json({ ok: true }));
+
+// ── Admin panel ─────────────────────────────────────────────────────────────
+// The page itself is public HTML — it contains no data and no secret. Every
+// byte of actual information sits behind /admin/api, which requires a Firebase
+// ID token carrying the `admin` custom claim.
+app.use('/admin/api', require('./admin').build(admin, db));
+
+app.get('/admin', (_req, res) => {
+  const html = fs
+    .readFileSync(path.join(__dirname, 'public', 'admin.html'), 'utf8')
+    // The web API key is a public client identifier (it already ships inside
+    // the Android app), not a credential. Injected rather than committed so it
+    // tracks the deployment.
+    .replace('__WEB_API_KEY__', process.env.FIREBASE_WEB_API_KEY || '');
+  res.set('Content-Type', 'text/html; charset=utf-8');
+  res.set('X-Robots-Tag', 'noindex, nofollow');
+  res.send(html);
+});
 
 /** Thrown inside the claim transaction when another account already holds the licence. */
 class LicenceTaken extends Error {}
