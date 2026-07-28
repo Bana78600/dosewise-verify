@@ -221,6 +221,67 @@ async function checkRateLimit(uid) {
 }
 
 /**
+ * POST /discussion/:id/vote — mark a post helpful, or take the mark back.
+ *
+ * Helpful-only, deliberately: a downvote would duplicate the report button and
+ * invite pile-ons on the trainees asking naive questions, who are exactly the
+ * people this board should keep comfortable.
+ *
+ * -> 200 { ok:true, score, voted }
+ */
+app.post('/discussion/:id/vote', async (req, res) => {
+  try {
+    const uid = await authenticate(req);
+    if (!uid) return res.status(401).json({ ok: false, reason: 'Please sign in again.' });
+
+    const profileSnap = await db.collection('users').doc(uid).get();
+    if (!profileSnap.exists || !profileSnap.data()?.approved) {
+      return res.status(403).json({ ok: false, reason: 'Your account is not verified yet.' });
+    }
+
+    const messageId = String(req.params.id || '').trim();
+    if (!messageId) return res.status(400).json({ ok: false, reason: 'Missing message id.' });
+
+    // You cannot vote up your own answer.
+    const authorSnap = await db.collection('discussionAuthors').doc(messageId).get();
+    if (authorSnap.exists && authorSnap.data()?.uid === uid) {
+      return res.json({ ok: false, reason: 'You cannot mark your own post as helpful.' });
+    }
+
+    const msgRef = db.collection('discussions').doc(messageId);
+    const voteRef = db.collection('votes').doc(`${messageId}__${uid}`);
+
+    // A transaction, not a read-then-write: two members voting at the same
+    // instant would both read the same score and the second would overwrite
+    // the first, silently losing a vote.
+    const result = await db.runTransaction(async (tx) => {
+      const [msg, vote] = await Promise.all([tx.get(msgRef), tx.get(voteRef)]);
+      if (!msg.exists) return { gone: true };
+
+      const current = Number(msg.data()?.score ?? 0);
+      if (vote.exists) {
+        tx.delete(voteRef);
+        tx.update(msgRef, { score: Math.max(0, current - 1) });
+        return { score: Math.max(0, current - 1), voted: false };
+      }
+      tx.set(voteRef, {
+        messageId,
+        uid, // read back by the owner so the app can show which posts they marked
+        at: admin.firestore.FieldValue.serverTimestamp(),
+      });
+      tx.update(msgRef, { score: current + 1 });
+      return { score: current + 1, voted: true };
+    });
+
+    if (result.gone) return res.json({ ok: false, reason: 'That post is no longer available.' });
+    return res.json({ ok: true, score: result.score, voted: result.voted });
+  } catch (e) {
+    console.error('vote error:', e);
+    return res.status(500).json({ ok: false, reason: 'Could not record your vote. Please try again.' });
+  }
+});
+
+/**
  * POST /discussion/:id/report
  * Headers: Authorization: Bearer <Firebase ID token>
  * -> 200 { ok:true, hidden:boolean }
@@ -275,6 +336,9 @@ app.post('/discussion/:id/report', async (req, res) => {
         hiddenAt: admin.firestore.FieldValue.serverTimestamp(),
       });
       await msgRef.delete();
+      // Votes on a pulled post are meaningless and would otherwise linger.
+      const stale = await db.collection('votes').where('messageId', '==', messageId).get();
+      await Promise.all(stale.docs.map((d) => d.ref.delete().catch(() => {})));
       return res.json({ ok: true, hidden: true });
     }
 
@@ -342,6 +406,9 @@ app.post('/discussion', async (req, res) => {
       text: body,
       displayName: isAnon ? 'Anonymous' : firstNameOf(profile.fullName),
       anonymous: isAnon,
+      // Written explicitly so every post sorts consistently — a missing field
+      // and a zero would order differently.
+      score: 0,
       createdAt: admin.firestore.FieldValue.serverTimestamp(),
     });
 
