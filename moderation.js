@@ -21,6 +21,7 @@
 
 const { reviewPost, isConfigured } = require('./agent');
 const { CATEGORIES } = require('./moderationPolicy');
+const { findAbuse } = require('./wordlist');
 
 // ── Deterministic pre-filter ────────────────────────────────────────────────
 // Runs before the agent: instant, free, independent of the API, and it catches
@@ -78,16 +79,35 @@ async function moderate(text) {
     };
   }
 
-  // 2. The agent reviews the substance.
-  if (!isConfigured()) {
-    console.error(
-      'moderation: agent not configured — need ANTHROPIC_API_KEY, MODERATION_AGENT_ID and MODERATION_ENVIRONMENT_ID. Rejecting post.',
-    );
+  // 2. Abuse wordlist — offline, free, English + Roman Urdu.
+  const abuse = findAbuse(body);
+  if (abuse.hit) {
     return {
       allowed: false,
-      reason: 'Message review is unavailable right now. Please try again shortly.',
-      categories: ['none'],
-      stage: 'unavailable',
+      reason:
+        abuse.severity === 'severe'
+          ? 'Your message contains language that is not acceptable on a professional board. Please rewrite it.'
+          : 'Your message reads as a personal criticism of someone. Please rephrase it to address the clinical point instead.',
+      categories: abuse.severity === 'severe' ? ['profanity'] : ['harassment'],
+      stage: 'wordlist',
+      // For the audit log only — never returned to the app.
+      terms: abuse.terms,
+    };
+  }
+
+  // 3. The agent reviews the substance — OPTIONAL.
+  //
+  // When it is not configured the board runs "filtered + reported" rather than
+  // "pre-approved": local checks gate every post, and anything they cannot
+  // judge is caught by members reporting it. That is a deliberate downgrade in
+  // exchange for zero running cost, and posting stays available rather than
+  // failing closed on a service that was never switched on.
+  if (!isConfigured()) {
+    return {
+      allowed: true,
+      reason: '',
+      categories: [],
+      stage: 'local-only',
     };
   }
 

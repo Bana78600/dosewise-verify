@@ -198,6 +198,93 @@ function firstNameOf(fullName) {
   return first.slice(0, 24);
 }
 
+const MAX_POSTS_PER_HOUR = 15;
+/** Reports needed before a post is pulled for review. */
+const REPORTS_TO_HIDE = 3;
+
+/** Rolling one-hour post limit, kept in one document per user. */
+async function checkRateLimit(uid) {
+  const ref = db.collection('rateLimits').doc(uid);
+  const cutoff = Date.now() - 60 * 60 * 1000;
+  const snap = await ref.get();
+  const recent = ((snap.exists ? snap.data()?.posts : null) ?? []).filter((t) => t > cutoff);
+
+  if (recent.length >= MAX_POSTS_PER_HOUR) {
+    return {
+      ok: false,
+      reason: `You have posted ${MAX_POSTS_PER_HOUR} times in the last hour. Please wait a while before posting again.`,
+    };
+  }
+  recent.push(Date.now());
+  await ref.set({ posts: recent }, { merge: true });
+  return { ok: true };
+}
+
+/**
+ * POST /discussion/:id/report
+ * Headers: Authorization: Bearer <Firebase ID token>
+ * -> 200 { ok:true, hidden:boolean }
+ *
+ * Members reporting each other is what covers the judgement calls no offline
+ * filter can make — a post that is unprofessional without containing a single
+ * listed word. Once enough distinct members report it, the post is moved out of
+ * the board and into a server-only collection for review.
+ */
+app.post('/discussion/:id/report', async (req, res) => {
+  try {
+    const uid = await authenticate(req);
+    if (!uid) return res.status(401).json({ ok: false, reason: 'Please sign in again.' });
+
+    const profileSnap = await db.collection('users').doc(uid).get();
+    if (!profileSnap.exists || !profileSnap.data()?.approved) {
+      return res.status(403).json({ ok: false, reason: 'Your account is not verified yet.' });
+    }
+
+    const messageId = String(req.params.id || '').trim();
+    if (!messageId) return res.status(400).json({ ok: false, reason: 'Missing message id.' });
+
+    const msgRef = db.collection('discussions').doc(messageId);
+    const msgSnap = await msgRef.get();
+    if (!msgSnap.exists) return res.json({ ok: true, hidden: true }); // already gone
+
+    // Nobody can report a post twice: the report id is the pair, so a repeat is
+    // an overwrite rather than a second vote.
+    const reportRef = db.collection('reports').doc(`${messageId}__${uid}`);
+    const already = await reportRef.get();
+    await reportRef.set({
+      messageId,
+      uid,
+      at: admin.firestore.FieldValue.serverTimestamp(),
+    });
+
+    if (already.exists) {
+      return res.json({ ok: true, hidden: false, alreadyReported: true });
+    }
+
+    const count = (await db.collection('reports').where('messageId', '==', messageId).get()).size;
+
+    if (count >= REPORTS_TO_HIDE) {
+      // Move it out of the board entirely rather than flagging it in place —
+      // a `hidden` field would still be readable by anyone querying Firestore.
+      const data = msgSnap.data();
+      const authorSnap = await db.collection('discussionAuthors').doc(messageId).get();
+      await db.collection('hiddenPosts').doc(messageId).set({
+        ...data,
+        authorUid: authorSnap.exists ? authorSnap.data()?.uid ?? null : null,
+        reportCount: count,
+        hiddenAt: admin.firestore.FieldValue.serverTimestamp(),
+      });
+      await msgRef.delete();
+      return res.json({ ok: true, hidden: true });
+    }
+
+    return res.json({ ok: true, hidden: false, reports: count });
+  } catch (e) {
+    console.error('report error:', e);
+    return res.status(500).json({ ok: false, reason: 'Could not report this post. Please try again.' });
+  }
+});
+
 /**
  * POST /discussion
  * Headers: Authorization: Bearer <Firebase ID token>
@@ -219,6 +306,11 @@ app.post('/discussion', async (req, res) => {
     if (!profile?.approved) {
       return res.status(403).json({ ok: false, reason: 'Your account is not verified yet.' });
     }
+
+    // Rate limit. Without an AI reviewer this is the main defence against
+    // someone flooding the board faster than members can report it.
+    const rl = await checkRateLimit(uid);
+    if (!rl.ok) return res.json({ ok: false, reason: rl.reason });
 
     const { text, anonymous } = req.body || {};
 
