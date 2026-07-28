@@ -19,9 +19,12 @@ const admin = require('firebase-admin');
 
 const email = process.argv[2];
 const REVOKE = process.argv.includes('--revoke');
+const RESET_2FA = process.argv.includes('--reset-2fa');
 
 if (!email || email.startsWith('--')) {
-  console.error('Usage: node scripts/make-admin.js <email> [--revoke]');
+  console.error('Usage: node scripts/make-admin.js <email> [--revoke] [--reset-2fa]');
+  console.error('  --reset-2fa  clear the authenticator so it can be set up again');
+  console.error('               (last resort: phone lost AND recovery codes gone)');
   process.exit(1);
 }
 
@@ -39,6 +42,15 @@ admin.initializeApp({ credential: admin.credential.cert(JSON.parse(svc)) });
   } catch {
     console.error(`No account found for ${email}. Sign up in the app first, then re-run this.`);
     process.exit(1);
+  }
+
+  if (RESET_2FA) {
+    await admin.firestore().collection('adminSecrets').doc(user.uid).delete();
+    // Any live second-factor session should die with the old authenticator.
+    await admin.auth().revokeRefreshTokens(user.uid);
+    console.log(`Cleared two-factor authentication for ${email}.`);
+    console.log('Next sign-in will walk through setting up an authenticator again.');
+    if (!process.argv.includes('--revoke')) process.exit(0);
   }
 
   const existing = user.customClaims ?? {};

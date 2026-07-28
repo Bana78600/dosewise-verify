@@ -71,6 +71,52 @@
   <button id="signin" class="primary" style="width:100%">Sign in</button>
 </div>
 
+<!-- Step 2: prove possession of the authenticator. -->
+<div id="twofa" class="login" style="display:none">
+  <h1>Two-factor</h1>
+  <p id="twofaHint">Enter the 6-digit code from your authenticator app</p>
+  <div id="twofaErr" class="err" style="display:none"></div>
+  <div class="field">
+    <input id="code" inputmode="numeric" autocomplete="one-time-code"
+           placeholder="000000" maxlength="11" style="text-align:center;letter-spacing:6px;font-size:20px">
+  </div>
+  <button id="verify" class="primary" style="width:100%">Verify</button>
+  <button id="useRecovery" style="width:100%;margin-top:8px">Use a recovery code</button>
+  <button id="back2fa" style="width:100%;margin-top:8px">Back</button>
+</div>
+
+<!-- Step 2b: first-time enrolment, forced before anything is reachable. -->
+<div id="enrol" class="login" style="display:none;max-width:420px">
+  <h1>Set up two-factor</h1>
+  <p>Scan this with Google Authenticator, Authy, or any authenticator app</p>
+  <div id="enrolErr" class="err" style="display:none"></div>
+  <div style="text-align:center;margin-bottom:14px">
+    <img id="qr" alt="QR code" style="border-radius:10px;background:#fff;padding:8px">
+  </div>
+  <div class="note">Can't scan? Enter this key by hand:<br>
+    <code id="secret" style="font-size:13px;letter-spacing:1px;color:var(--primary);word-break:break-all"></code>
+  </div>
+  <div class="field">
+    <input id="enrolCode" inputmode="numeric" placeholder="Enter the 6-digit code to confirm"
+           maxlength="6" style="text-align:center;letter-spacing:6px;font-size:20px">
+  </div>
+  <button id="confirmEnrol" class="primary" style="width:100%">Confirm</button>
+</div>
+
+<!-- Shown once. These are the only way back in if the phone is lost. -->
+<div id="recovery" class="login" style="display:none;max-width:420px">
+  <h1>Save your recovery codes</h1>
+  <p>Each one works once, if you lose your phone</p>
+  <div class="note" style="border-color:var(--warn);color:var(--warn)">
+    This is the only time these are shown. Write them down or store them in a
+    password manager now — they cannot be retrieved later.
+  </div>
+  <pre id="codes" style="background:var(--bg);border:1px solid var(--border);border-radius:8px;
+    padding:14px;font-size:14px;line-height:2;letter-spacing:1px;text-align:center"></pre>
+  <button id="copyCodes" style="width:100%;margin-bottom:8px">Copy to clipboard</button>
+  <button id="doneCodes" class="primary" style="width:100%">I have saved them</button>
+</div>
+
 <div id="app" style="display:none">
   <div class="top">
     <h1>DoseWise Admin</h1>
@@ -93,6 +139,14 @@ const $ = (id) => document.getElementById(id);
 
 // sessionStorage, not localStorage: the session dies with the tab.
 let auth = JSON.parse(sessionStorage.getItem("dw_admin") || "null");
+// The second-factor receipt, issued only after a correct authenticator code.
+let mfa = sessionStorage.getItem("dw_admin_2fa") || null;
+
+function show(which){
+  for(const id of ["login","twofa","enrol","recovery","app"])
+    $(id).style.display = (id === which) ? "block" : "none";
+}
+function setMfa(t){ mfa = t; sessionStorage.setItem("dw_admin_2fa", t); }
 
 function esc(s){ return String(s ?? "").replace(/[&<>"']/g, c => (
   {"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c])); }
@@ -122,32 +176,118 @@ async function refresh(){
   sessionStorage.setItem("dw_admin", JSON.stringify(auth));
 }
 
-async function api(path, opts = {}){
+async function api(path, opts = {}, retried = false){
   // ID tokens last an hour; refresh a little early rather than letting a click fail.
   if(auth && Date.now() - auth.at > 50*60*1000) await refresh().catch(()=>{});
   const r = await fetch("/admin/api" + path, {
     ...opts,
     headers: { ...(opts.headers||{}), "Content-Type":"application/json",
-               Authorization: "Bearer " + auth.idToken },
+               Authorization: "Bearer " + auth.idToken,
+               ...(mfa ? { "X-Admin-2FA": mfa } : {}) },
   });
-  if(r.status === 401){ await refresh(); return api(path, opts); }
-  const j = await r.json();
-  if(r.status === 403) throw new Error(j.reason || "Not an administrator.");
+  let j = null; try{ j = await r.json(); }catch{}
+
+  // 428 = signed in, but no authenticator enrolled yet. Enrolment is compulsory.
+  if(r.status === 428 || j?.code === "ENROL_2FA"){ await beginEnrol(); throw new Error("__handled__"); }
+  // 401 with NEED_2FA = the password is fine, the second factor is missing or stale.
+  if(j?.code === "NEED_2FA"){ askForCode(); throw new Error("__handled__"); }
+  if(r.status === 401 && !retried){ await refresh(); return api(path, opts, true); }
+  if(r.status === 403) throw new Error(j?.reason || "Not an administrator.");
   return j;
 }
+
+// ── Second factor ───────────────────────────────────────────────────────────
+
+function askForCode(msg){
+  show("twofa");
+  $("twofaHint").textContent = msg || "Enter the 6-digit code from your authenticator app";
+  $("code").value = ""; $("code").focus();
+}
+
+async function beginEnrol(){
+  show("enrol");
+  $("enrolErr").style.display = "none";
+  const r = await fetch("/admin/api/2fa/enrol", { method:"POST",
+    headers:{ "Content-Type":"application/json", Authorization:"Bearer " + auth.idToken } });
+  const j = await r.json();
+  if(!j.ok){
+    // Already enrolled — this is a code prompt, not a setup.
+    askForCode(); return;
+  }
+  $("qr").src = j.qr;
+  $("secret").textContent = j.secret;
+  $("enrolCode").value = ""; $("enrolCode").focus();
+}
+
+$("confirmEnrol").onclick = async () => {
+  const b = $("confirmEnrol"); b.disabled = true; $("enrolErr").style.display = "none";
+  try{
+    const r = await fetch("/admin/api/2fa/confirm", { method:"POST",
+      headers:{ "Content-Type":"application/json", Authorization:"Bearer " + auth.idToken },
+      body: JSON.stringify({ code: $("enrolCode").value }) });
+    const j = await r.json();
+    if(!j.ok) throw new Error(j.reason || "Could not confirm.");
+    setMfa(j.session);
+    $("codes").textContent = j.recoveryCodes.join("\n");
+    show("recovery");
+  }catch(e){
+    $("enrolErr").textContent = e.message; $("enrolErr").style.display = "block";
+  }finally{ b.disabled = false; }
+};
+$("enrolCode").addEventListener("keydown", e => { if(e.key === "Enter") $("confirmEnrol").click(); });
+
+$("copyCodes").onclick = () => {
+  navigator.clipboard?.writeText($("codes").textContent)
+    .then(() => { $("copyCodes").textContent = "Copied"; })
+    .catch(() => { $("copyCodes").textContent = "Select the codes above and copy them"; });
+};
+$("doneCodes").onclick = () => start();
+
+let recoveryMode = false;
+$("useRecovery").onclick = () => {
+  recoveryMode = !recoveryMode;
+  $("twofaHint").textContent = recoveryMode
+    ? "Enter one of your recovery codes"
+    : "Enter the 6-digit code from your authenticator app";
+  $("useRecovery").textContent = recoveryMode
+    ? "Use my authenticator instead" : "Use a recovery code";
+  $("code").value = ""; $("code").focus();
+};
+$("back2fa").onclick = () => { sessionStorage.clear(); location.reload(); };
+
+$("verify").onclick = async () => {
+  const b = $("verify"); b.disabled = true; $("twofaErr").style.display = "none";
+  try{
+    const r = await fetch("/admin/api/2fa/" + (recoveryMode ? "recovery" : "verify"), {
+      method:"POST",
+      headers:{ "Content-Type":"application/json", Authorization:"Bearer " + auth.idToken },
+      body: JSON.stringify({ code: $("code").value }) });
+    const j = await r.json();
+    if(!j.ok) throw new Error(j.reason || "That did not work.");
+    setMfa(j.session);
+    if(recoveryMode && typeof j.remaining === "number" && j.remaining <= 2){
+      alert(`${j.remaining} recovery code${j.remaining === 1 ? "" : "s"} left. Consider resetting two-factor to get a fresh set.`);
+    }
+    await start();
+  }catch(e){
+    $("twofaErr").textContent = e.message; $("twofaErr").style.display = "block";
+  }finally{ b.disabled = false; }
+};
+$("code").addEventListener("keydown", e => { if(e.key === "Enter") $("verify").click(); });
 
 $("signin").onclick = async () => {
   const btn = $("signin"); btn.disabled = true; $("loginErr").style.display = "none";
   try{
     auth = await signIn($("email").value.trim(), $("password").value);
     sessionStorage.setItem("dw_admin", JSON.stringify(auth));
+    $("password").value = "";
     await start();
   }catch(e){
     $("loginErr").textContent = e.message; $("loginErr").style.display = "block";
   }finally{ btn.disabled = false; }
 };
 $("password").addEventListener("keydown", e => { if(e.key === "Enter") $("signin").click(); });
-$("signout").onclick = () => { sessionStorage.removeItem("dw_admin"); location.reload(); };
+$("signout").onclick = () => { sessionStorage.clear(); location.reload(); };
 
 const TABS = [
   ["accounts","Accounts"], ["board","Board"], ["reported","Reported"],
@@ -159,8 +299,7 @@ async function start(){
   try{
     const o = await api("/overview");
     if(o.ok === false) throw new Error(o.reason);
-    $("login").style.display = "none";
-    $("app").style.display = "block";
+    show("app");
     $("who").textContent = auth.email;
     $("cards").innerHTML = [
       ["Accounts", o.users], ["Approved", o.approved], ["Pending", o.pending],
@@ -172,8 +311,10 @@ async function start(){
       b.onclick = () => { tab = b.dataset.tab; start(); });
     await render();
   }catch(e){
-    sessionStorage.removeItem("dw_admin"); auth = null;
-    $("login").style.display = "block"; $("app").style.display = "none";
+    // beginEnrol()/askForCode() have already put the right screen up.
+    if(e.message === "__handled__") return;
+    sessionStorage.clear(); auth = null; mfa = null;
+    show("login");
     $("loginErr").textContent = e.message; $("loginErr").style.display = "block";
   }
 }

@@ -12,13 +12,52 @@
  * "anonymous" has to mean something.
  */
 
+const crypto = require('crypto');
 const express = require('express');
+const QRCode = require('qrcode');
+const totp = require('./totp');
 
-function build(admin, db) {
+const SESSION_HOURS = 8;
+const MAX_CODE_ATTEMPTS = 8;
+
+function build(admin, db, sessionSecret) {
   const router = express.Router();
 
-  /** Verify the token and the admin claim. */
-  async function requireAdmin(req, res, next) {
+  // ── Second-factor session tokens ──────────────────────────────────────────
+  // Passing the code proves possession of the phone; this token is the receipt.
+  // Signed with a key derived from the service account, so it survives a
+  // redeploy without needing another environment variable to be set.
+
+  const b64u = (b) => Buffer.from(b).toString('base64url');
+  const sign = (payload) =>
+    crypto.createHmac('sha256', sessionSecret).update(payload).digest('base64url');
+
+  function issueSession(uid) {
+    const payload = b64u(JSON.stringify({ uid, exp: Date.now() + SESSION_HOURS * 3600 * 1000 }));
+    return `${payload}.${sign(payload)}`;
+  }
+
+  function readSession(token) {
+    const [payload, sig] = String(token ?? '').split('.');
+    if (!payload || !sig) return null;
+    const expected = sign(payload);
+    const a = Buffer.from(sig);
+    const b = Buffer.from(expected);
+    if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) return null;
+    try {
+      const data = JSON.parse(Buffer.from(payload, 'base64url').toString());
+      if (!data.exp || data.exp < Date.now()) return null;
+      return data;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * First gate: who you are. Verifies the Firebase ID token and the admin
+   * claim. This alone is NOT enough to reach any data.
+   */
+  async function requireAdminIdentity(req, res, next) {
     const authz = req.headers.authorization || '';
     const idToken = authz.startsWith('Bearer ') ? authz.slice(7) : null;
     if (!idToken) return res.status(401).json({ ok: false, reason: 'Not signed in.' });
@@ -35,7 +74,128 @@ function build(admin, db) {
     }
   }
 
-  router.use(requireAdmin);
+  /**
+   * Second gate: possession of the enrolled authenticator. A stolen password —
+   * even one that gets a genuine, correctly-claimed Firebase token — stops here.
+   *
+   * Enrolment is compulsory: an admin who has not set up an authenticator can
+   * reach the enrolment routes and nothing else, so there is no window in which
+   * a password alone is sufficient.
+   */
+  async function requireSecondFactor(req, res, next) {
+    const snap = await db.collection('adminSecrets').doc(req.adminUid).get();
+    if (!snap.exists || !snap.data()?.secret) {
+      return res.status(428).json({ ok: false, code: 'ENROL_2FA', reason: 'Set up two-factor authentication to continue.' });
+    }
+    const session = readSession(req.headers['x-admin-2fa']);
+    if (!session || session.uid !== req.adminUid) {
+      return res.status(401).json({ ok: false, code: 'NEED_2FA', reason: 'Enter your authenticator code.' });
+    }
+    return next();
+  }
+
+  router.use(requireAdminIdentity);
+
+  // ── Two-factor enrolment and verification ─────────────────────────────────
+  // These sit BELOW the identity gate but ABOVE the second-factor gate — they
+  // are the only routes reachable with a password alone.
+
+  const secretRef = (uid) => db.collection('adminSecrets').doc(uid);
+
+  router.get('/2fa/status', async (req, res) => {
+    const snap = await secretRef(req.adminUid).get();
+    const d = snap.exists ? snap.data() : null;
+    res.json({
+      ok: true,
+      enrolled: Boolean(d?.secret),
+      recoveryRemaining: (d?.recovery ?? []).length,
+      sessionValid: Boolean(readSession(req.headers['x-admin-2fa'])),
+    });
+  });
+
+  router.post('/2fa/enrol', async (req, res) => {
+    const snap = await secretRef(req.adminUid).get();
+    if (snap.exists && snap.data()?.secret) {
+      return res.json({ ok: false, reason: 'Two-factor authentication is already set up.' });
+    }
+    const secret = totp.generateSecret();
+    const uri = totp.otpauthUri({ secret, account: req.adminEmail ?? req.adminUid });
+    // Held as `pending` until a code proves the app actually scanned it —
+    // storing it as live would lock the admin out if the scan silently failed.
+    await secretRef(req.adminUid).set(
+      { pending: secret, pendingAt: admin.firestore.FieldValue.serverTimestamp() },
+      { merge: true },
+    );
+    res.json({ ok: true, secret, uri, qr: await QRCode.toDataURL(uri, { margin: 1, width: 220 }) });
+  });
+
+  router.post('/2fa/confirm', async (req, res) => {
+    const snap = await secretRef(req.adminUid).get();
+    const pending = snap.exists ? snap.data()?.pending : null;
+    if (!pending) return res.json({ ok: false, reason: 'Start the setup again.' });
+
+    const step = totp.verify(pending, req.body?.code);
+    if (step === null) return res.json({ ok: false, reason: 'That code is not right. Check the six digits and try again.' });
+
+    const recovery = totp.generateRecoveryCodes(8);
+    await secretRef(req.adminUid).set(
+      {
+        secret: pending,
+        pending: admin.firestore.FieldValue.delete(),
+        recovery: recovery.map(totp.hashRecovery),
+        lastUsedStep: step,
+        attempts: 0,
+        enrolledAt: admin.firestore.FieldValue.serverTimestamp(),
+      },
+      { merge: true },
+    );
+    await audit(req, '2fa.enrol', req.adminEmail);
+    // Shown once and never again — only hashes are kept.
+    res.json({ ok: true, recoveryCodes: recovery, session: issueSession(req.adminUid) });
+  });
+
+  router.post('/2fa/verify', async (req, res) => {
+    const ref = secretRef(req.adminUid);
+    const snap = await ref.get();
+    const d = snap.exists ? snap.data() : null;
+    if (!d?.secret) return res.status(428).json({ ok: false, code: 'ENROL_2FA', reason: 'Set up two-factor authentication first.' });
+
+    if ((d.attempts ?? 0) >= MAX_CODE_ATTEMPTS) {
+      return res.json({ ok: false, reason: 'Too many incorrect codes. Use a recovery code, or wait and try again later.' });
+    }
+
+    // lastUsedStep is what stops a code being replayed inside its 30 seconds.
+    const step = totp.verify(d.secret, req.body?.code, { lastUsedStep: d.lastUsedStep ?? null });
+    if (step === null) {
+      await ref.set({ attempts: (d.attempts ?? 0) + 1 }, { merge: true });
+      await audit(req, '2fa.failed', req.adminEmail);
+      return res.json({ ok: false, reason: 'That code is not right, or has already been used.' });
+    }
+    await ref.set({ lastUsedStep: step, attempts: 0 }, { merge: true });
+    res.json({ ok: true, session: issueSession(req.adminUid) });
+  });
+
+  router.post('/2fa/recovery', async (req, res) => {
+    const ref = secretRef(req.adminUid);
+    const snap = await ref.get();
+    const d = snap.exists ? snap.data() : null;
+    if (!d?.secret) return res.status(428).json({ ok: false, code: 'ENROL_2FA', reason: 'Set up two-factor authentication first.' });
+
+    const idx = totp.matchRecovery(d.recovery, req.body?.code);
+    if (idx === -1) {
+      await audit(req, '2fa.recovery_failed', req.adminEmail);
+      return res.json({ ok: false, reason: 'That recovery code is not valid.' });
+    }
+    // Single use.
+    const remaining = [...(d.recovery ?? [])];
+    remaining.splice(idx, 1);
+    await ref.set({ recovery: remaining, attempts: 0 }, { merge: true });
+    await audit(req, '2fa.recovery_used', `${remaining.length} left`);
+    res.json({ ok: true, session: issueSession(req.adminUid), remaining: remaining.length });
+  });
+
+  // Everything past this point needs the second factor.
+  router.use(requireSecondFactor);
 
   const ts = (v) => (v?.toDate ? v.toDate().toISOString() : null);
 

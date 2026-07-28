@@ -4,11 +4,16 @@
   "private": true,
   "description": "PMDC licence verification + Firebase approval for DoseWise",
   "main": "index.js",
-  "engines": { "node": ">=20" },
-  "scripts": { "start": "node index.js" },
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node index.js"
+  },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.70.0",
     "express": "^4.21.2",
-    "firebase-admin": "^13.0.2"
+    "firebase-admin": "^13.0.2",
+    "qrcode": "^1.5.4"
   }
 }

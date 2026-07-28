@@ -46,7 +46,16 @@ app.get('/health', (_req, res) => res.json({ ok: true }));
 // The page itself is public HTML — it contains no data and no secret. Every
 // byte of actual information sits behind /admin/api, which requires a Firebase
 // ID token carrying the `admin` custom claim.
-app.use('/admin/api', require('./admin').build(admin, db));
+// The key that signs second-factor sessions is derived from the service
+// account rather than read from its own environment variable: it is already
+// secret, already present, and stable across redeploys, so sessions survive a
+// deploy and there is no extra setting to forget.
+const ADMIN_SESSION_SECRET = require('crypto')
+  .createHash('sha256')
+  .update(`${JSON.parse(svc).private_key}:dosewise-admin-2fa`)
+  .digest();
+
+app.use('/admin/api', require('./admin').build(admin, db, ADMIN_SESSION_SECRET));
 
 app.get('/admin', (_req, res) => {
   const html = fs
