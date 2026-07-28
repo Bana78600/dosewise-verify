@@ -37,6 +37,9 @@ app.use((req, res, next) => {
   next();
 });
 
+/** Public client identifier for project dose-wise-52a48 — see the note below. */
+const DEFAULT_WEB_API_KEY = 'AIzaSyCsijb5yWNBb9aC7aKNbAYSZbinkqQjuRw';
+
 app.get('/health', (_req, res) => res.json({ ok: true }));
 
 // ── Admin panel ─────────────────────────────────────────────────────────────
@@ -48,10 +51,12 @@ app.use('/admin/api', require('./admin').build(admin, db));
 app.get('/admin', (_req, res) => {
   const html = fs
     .readFileSync(path.join(__dirname, 'public', 'admin.html'), 'utf8')
-    // The web API key is a public client identifier (it already ships inside
-    // the Android app), not a credential. Injected rather than committed so it
-    // tracks the deployment.
-    .replace('__WEB_API_KEY__', process.env.FIREBASE_WEB_API_KEY || '');
+    // A Firebase web API key is a public client identifier, not a credential —
+    // the same value already ships inside the Android app, where anyone can
+    // read it. What protects the panel is the admin custom claim, verified
+    // server-side on every request. Defaulted here so the panel works with no
+    // extra deployment configuration; the env var stays as an override.
+    .replace('__WEB_API_KEY__', process.env.FIREBASE_WEB_API_KEY || DEFAULT_WEB_API_KEY);
   res.set('Content-Type', 'text/html; charset=utf-8');
   res.set('X-Robots-Tag', 'noindex, nofollow');
   res.send(html);
